@@ -405,11 +405,21 @@ def getHAGWindow(hagFile, geometry, windowShape):
     return hagWin_array
 
 
-def findFile(path, row, directory):
-    """ finds file in directory containing the given path and row in the file name"""
-    files = glob(directory + "/*.tif")
+def findFile(path, row, directory=None, files_dict=None):
+    """ finds file in directory containing the given path and row in the file name.
+    Either the directory to search can be passed, or a dictionary for file name and
+    file path. Turns out it's much faster to earch a dictionary keys than a list of
+    file locations. This is a little clunky and assumes inconsistent file naming. 
+    Easier would be just to glob(directory + "/f{path}_{row}*.tif")"""
+    if files_dict == None and directory == None:
+        raise ValueError("One of 'files' or 'directory' must be specified for findFind function")
+    elif files_dict == None and type(directory) == str:
+        files = glob(directory + "/*.tif")
+        files_dict = {os.path.basename(file):file for file in files}
+    elif type(files_dict) != dict and directory == None:
+        raise ValueError("If no 'directory' value passed, files must be list of files")
     
-    finds = [f for f in files if path in f and row in f]
+    finds = [v for k,v in files_dict.items() if path in k and row in k]
   
     if len(finds) == 1:
         return finds[0]
@@ -475,8 +485,47 @@ def getGaussian(array, sigma, channels=0):
     return out_gaussian
 
 
-def segmentWindowV3(dfrow, outdir, ortho, hag, writeOutStack=True, returnArray=True, overwrite=False):
+def calculateMSAVI(red_band, nir_band, dtype):
+    if red_band.dtype != dtype:
+        raise ValueError(f"Error in MSAVI calculation. Expected input bands to be of type {dtype}")
+    
+    zeros = (red_band == 0) & (nir_band == 0)
+    # MSAVI2 expects values to be reflectance numbers between 0 and 1. Divide by max value of dtype (max value of uint8 is 255, uint16 is 65535).
+    red_band = red_band/np.iinfo(dtype).max
+    nir_band = nir_band/np.iinfo(dtype).max
+    msaviFloat = ((2 * nir_band + 1) - np.sqrt(np.square(2 * nir_band + 1) - (8 * (nir_band - red_band)))) / 2
+    
+    # although this is a vegetation index of band ratios, we can assume that if both input bands have zero
+    #  values, the result should be absolute minimum, rather than zero, which is the middle value the
+    #  range of possible values (-1 to 1)
+    msaviFloat[zeros] = -1
+    
+    return msaviFloat
 
+
+def calculateNDVI(red_band, nir_band, dtype):
+    if red_band.dtype != dtype:
+        raise ValueError(f"Error in NDVI calculation. Expected input bands to be of type {dtype}")
+    
+    zeros = (red_band == 0) & (nir_band == 0)
+    # although NDVI ratio shouldn't matter. At the extremes of values (dtype minimum and dtype maximum)
+    #  the calculation breaks down with overflows in the numerator and denominator. Bring into float from 0 to 1
+    red_band = red_band/np.iinfo(dtype).max
+    nir_band = nir_band/np.iinfo(dtype).max
+    
+    ndviFloat = (nir_band - red_band) / (nir_band + red_band)
+    
+    # although this is a vegetation index of band ratios, we can assume that if both input bands have zero
+    #  values, the result should be absolute minimum, rather than zero, which is the middle value the
+    #  range of possible values (-1 to 1)
+    ndviFloat[zeros] = -1
+    # in cases where
+    
+    return ndviFloat
+
+
+def segmentWindowV3(dfrow, outdir, ortho, hag, writeOutStack=True, returnArray=True, overwrite=False):
+    
     version_suffix = "TrainingStackV3"
     ofile = f"{dfrow.path}_{dfrow.row}_{version_suffix}.tif"
     ofile_path = os.path.join(outdir, ofile)
@@ -514,10 +563,8 @@ def segmentWindowV3(dfrow, outdir, ortho, hag, writeOutStack=True, returnArray=T
     local_stack_ortho = getPropertyOfSegments(local_ortho, ness_segs, ness_labels, properties=["mean"])
     local_stack_ortho = np.stack(local_stack_ortho)
     
-    bandRed = local_stack_ortho[0]/np.iinfo(np.uint16).max
-    bandNIR = local_stack_ortho[3]/np.iinfo(np.uint16).max
-    msavi_float = ((2 * bandNIR + 1) - np.sqrt(np.square(2 * bandNIR + 1) - (8 * (bandNIR - bandRed)))) / 2
-    ndvi_float = (bandNIR - bandRed) / (bandNIR + bandRed)
+    msavi_float = calculateMSAVI(red_band=local_stack_ortho[0], nir_band=local_stack_ortho[3], dtype=np.uint16)
+    ndvi_float = calculateNDVI(red_band=local_stack_ortho[0], nir_band=local_stack_ortho[3], dtype=np.uint16)
     gaussianSig2 = getGaussian(local_ortho, 2, channels=len(local_ortho)) # Gaussian Blur with Sigma of 2
     gaussianSig5 = getGaussian(local_ortho, 5, channels=len(local_ortho)) # Gaussian Blur with Sigma of 5
     ndpi = calcNDPI(local_stack_ortho)
@@ -572,7 +619,7 @@ def segmentWindowV3(dfrow, outdir, ortho, hag, writeOutStack=True, returnArray=T
             oras.colorinterp = colorinterps
             for i, band in enumerate(bands):
                 oras.set_band_description(i+1, band)        
-        print(f"Wrote training stack out to {ofile}")
+        print(f"Wrote training stack out to {ofile_path}")
         
     if returnArray:
         return full_stack
@@ -630,6 +677,10 @@ def createLocalHistogramOrtho(dfrow, outdir, ortho, overwrite=False):
     
     local_ortho, kwargs = getOrthoWindow(ortho, dfrow.geometry)
 
+    if not isinstance(local_ortho, np.ndarray):
+        print(f"Requested window is out of extent of {ortho}. Returning None")
+        return None
+    
     local_ortho = localHistogramOverEntropy(local_ortho)
     
     bands = ["RED", "GREEN", "BLUE", "NIR"]
@@ -638,6 +689,6 @@ def createLocalHistogramOrtho(dfrow, outdir, ortho, overwrite=False):
         dst.write(local_ortho)
         for i, band in enumerate(bands):
                 dst.set_band_description(i+1, band + "_LHE")
-    print(f"Finished with {ofile}")
+    print(f"Finished with {ofile_path}")
     
     return ofile_path
