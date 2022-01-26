@@ -795,6 +795,50 @@ def getSentinelBandFile(band_num, data_loc, suffix=""):
     if len(files) == 1:
         return files[0]
     elif len(files) > 1:
-        raise ValueError(f"To many file matches for {band_num}")
+        flist = "\n".join(files)
+        raise ValueError(f"To many file matches for {band_num}\n{flist}")
     else:
         raise ValueError(f"No file matches for {band_num}")
+
+        
+def readResampledWindow(sentFile, ortho_file, returnData=True):
+    with rio.open(ortho_file) as src:
+        ortho_ftprt = box(*src.bounds)
+        oWidth = src.width
+        oHeight = src.height
+        ortho_res = src.res[0]
+        kwargs = src.profile
+    
+    with rio.open(sentFile) as src:
+        sent_res = src.res[0]
+        ortho_ftprt_buff = ortho_ftprt.buffer(sent_res)
+        window = rio.windows.from_bounds(*ortho_ftprt.bounds, transform=src.transform)#, height=oHeight, width=oWidth)
+        
+        # buffer before read to prevent excessive pixel shift
+        window_buff = rio.windows.from_bounds(*ortho_ftprt_buff.bounds, transform=src.transform)#.round_offsets()#.round_shape()#, height=oHeight, width=oWidth)
+        sent_resamp = src.read(1, window=window_buff, out_shape=(int(window_buff.height*(sent_res/ortho_res)), int(window_buff.width*(sent_res/ortho_res))))
+    
+    # calculate buffer offset in pix and then trim 
+    ulOff_xdiff = abs(window_buff.col_off-window.col_off)
+    ulOff_ydiff = abs(window_buff.row_off-window.row_off)
+    lrOff_xdiff =  abs((window_buff.col_off+window_buff.width) - (window.col_off + window.width))
+    lrOff_ydiff =  abs((window_buff.row_off+window_buff.height) - (window.row_off + window.height))
+    ulOff_xdiff_pix = round(sent_res*ulOff_xdiff/ortho_res)
+    ulOff_ydiff_pix = round(sent_res*ulOff_ydiff/ortho_res)
+    lrOff_xdiff_pix = round(sent_res*lrOff_xdiff/ortho_res)
+    lrOff_ydiff_pix = round(sent_res*lrOff_ydiff/ortho_res)
+
+    sent_resamp = sent_resamp[ulOff_ydiff_pix:-lrOff_ydiff_pix, ulOff_xdiff_pix:-lrOff_xdiff_pix]
+    
+    if returnData:
+        return sent_resamp
+    else:
+        odir = "R:/ProjectData/PAG2019/EPCExtent_30cm/Sentinel_Data"
+        os.makedirs(odir, exist_ok=True)
+        path = os.path.basename(ortho_file).split("_")[0]
+        row = os.path.basename(ortho_file).split("_")[1]
+        ofile = os.path.join(odir, f"{path}_{row}.tif")
+        kwargs.update(count=1)
+        with rio.open(ofile, "w", **kwargs) as dst:
+            dst.write(sent_resamp, 1)
+        return ofile
